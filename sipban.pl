@@ -34,7 +34,7 @@ use Socket;
 use Fcntl;
 use Net::Whois::IP qw(whoisip_query);
 use Tie::RefHash;
-use Time::HiRes qw(usleep);
+use Time::HiRes qw(usleep time);
 use Proc::PID::File;
 use File::Basename;
 use Config::Simple;
@@ -57,6 +57,18 @@ die "Already runnig" if Proc::PID::File->running( dir=>"/tmp/", name => basename
 
 my %Config;
 Config::Simple->import_from('/etc/sipban.conf', \%Config) or die Config::Simple->error();
+
+# No Auth configuration :
+my %pendingAuth = ();
+my $lastNoAuthBanTime = 0; # Unix time
+if (! exists $Config{'noauth.enabled'} ){ $Config{'noauth.enabled'} = 1; }
+if (! exists $Config{'noauth.graceperiod'} ){ $Config{'noauth.graceperiod'} = 5; }
+if (! exists $Config{'noauth.baninterval'} ){ $Config{'noauth.baninterval'} = 0.1; }
+
+# Flood configuration :
+if (! exists $Config{'flood.enabled'} ){ $Config{'flood.enabled'} = 0; }
+if (! exists $Config{'flood.count'} ){ $Config{'flood.count'} = 1000; }
+if (! exists $Config{'flood.interval'} ){ $Config{'flood.interval'} = 1; }
 
 #--------------------#
 # Control Parameters #
@@ -428,29 +440,38 @@ my %AMI_Handler = (
             my ($service)    = $$packet_content_ref =~ /Service\:\s(.*?)\n/isx;
             my ($account_id) = $$packet_content_ref =~ /AccountID\:\s(.*?)\n/isx;
             my ($ipvx, $prot, $remote_ip, $remote_port)  = $$packet_content_ref =~ /RemoteAddress\:\sIPV(4|6)\/(.*?)\/(.*?)\/(.*?)\n/isx;
+            my ($sessionID) = $$packet_content_ref =~ /SessionID\:\s(.*?)\n/isx;
             if( ! defined $remote_ip ){
                 print LOG Time_Stamp() . " REMOTE IP EMPTY. packet_content_ref:\n$$packet_content_ref\n";
                 return;
             }elsif ( ($service eq 'PJSIP') || ($service eq 'SIP') || ($service eq 'IAX') || ($service eq 'IAX2') || ($service eq 'AMI') ) {
                 my $now = time();
-                my ($count,$cached) = getCacheMatch($remote_ip);
-                $remote_ip = NetAddr::IP->new($remote_ip);
-                $remote_ip = $remote_ip->addr();
-                if($count != undef) {
-                    $count++;
-                    $cache{$remote_ip} = [ $count, $cached ];
-                    if($count>$Config{'flood.count'}) {
-                        unless( exists($ban_ip{"$remote_ip"}) ) {
-                            if( Iptables_Block($remote_ip,'Challenge Sent') eq 1 ){
-                                $ban_ip{$remote_ip} = time() + $Config{'timer.ban'};
+                if($Config{'noauth.enabled'} == 1){
+                    my $pendingAuth_entry = $pendingAuth{$sessionID};
+                    if (! $pendingAuth_entry) {
+                        $pendingAuth{$sessionID} = [ $remote_ip, $remote_port, $now ];
+                    }
+                }
+                if($Config{'flood.enabled'} == 1){
+                    my ($count,$cached) = getCacheMatch($remote_ip);
+                    $remote_ip = NetAddr::IP->new($remote_ip);
+                    $remote_ip = $remote_ip->addr();
+                    if($count != undef) {
+                        $count++;
+                        $cache{$remote_ip} = [ $count, $cached ];
+                        if($count>$Config{'flood.count'}) {
+                            unless( exists($ban_ip{"$remote_ip"}) ) {
+                                if( Iptables_Block($remote_ip,'Challenge Sent') eq 1 ){
+                                    $ban_ip{$remote_ip} = time() + $Config{'timer.ban'};
+                                }
                             }
                         }
+                    } else {
+                        $count=1;
+                        $cache{$remote_ip} = [ $count, $now ];
                     }
-                } else {
-                    $count=1;
-                    $cache{$remote_ip} = [ $count, $now ];
+                    print LOG Time_Stamp() . " ChallengeSent to IPV$ipvx/$prot/$remote_ip/$remote_port, Increasing Failure Count : $count/" . $Config{'flood.count'} . "\n";
                 }
-                print LOG Time_Stamp() . " ChallengeSent to IPV$ipvx/$prot/$remote_ip/$remote_port, Increasing Failure Count : $count/" . $Config{'flood.count'} . "\n";
             }
         },
         #-----------------------------
@@ -470,20 +491,26 @@ my %AMI_Handler = (
             my ($service)    = $$packet_content_ref =~ /Service\:\s(.*?)\n/isx;
             my ($account_id) = $$packet_content_ref =~ /AccountID\:\s(.*?)\n/isx;
             my ($ipvx, $prot, $remote_ip, $remote_port)  = $$packet_content_ref =~ /RemoteAddress\:\sIPV(4|6)\/(.*?)\/(.*?)\/(.*?)\n/isx;
+            my ($sessionID) = $$packet_content_ref =~ /SessionID\:\s(.*?)\n/isx;
             if( ! defined $remote_ip ){
                 return;
             }elsif ( ($service eq 'PJSIP') || ($service eq 'SIP') || ($service eq 'IAX') || ($service eq 'IAX2') || ($service eq 'AMI') ) {
-                my ($count,$cached) = getCacheMatch($remote_ip);
-                $remote_ip = NetAddr::IP->new($remote_ip);
-                $remote_ip = $remote_ip->addr();
-                if($count != undef) {
-                    $count--;
-                    if($count == 0){
-                        delete $cache{$remote_ip};
-                    }else{
-                        $cache{$remote_ip} = [ $count, $cached ];
+                if($Config{'noauth.enabled'} == 1){
+                    delete $pendingAuth{$sessionID};
+                }
+                if($Config{'flood.enabled'} == 1){
+                    my ($count,$cached) = getCacheMatch($remote_ip);
+                    $remote_ip = NetAddr::IP->new($remote_ip);
+                    $remote_ip = $remote_ip->addr();
+                    if($count != undef) {
+                        $count--;
+                        if($count == 0){
+                            delete $cache{$remote_ip};
+                        }else{
+                            $cache{$remote_ip} = [ $count, $cached ];
+                        }
+                        print LOG Time_Stamp() . " SucessfulAuth by IPV$ipvx/$prot/$remote_ip/$remote_port, Decreasing Failure count : $count/" . $Config{'flood.count'} . "\n";
                     }
-                    print LOG Time_Stamp() . " SucessfulAuth by IPV$ipvx/$prot/$remote_ip/$remote_port, Decreasing Failure count : $count/" . $Config{'flood.count'} . "\n";
                 }
             }
         },
@@ -1017,7 +1044,7 @@ while (1) { # Main loop #
             Handle_Clients($client);
         }
     }
-    
+
     # Timer operations
     my $current_time = time();
     if ($current_time >= $Ping_Time) {
@@ -1028,6 +1055,37 @@ while (1) { # Main loop #
     # Clean on block time lapse
     if ($current_time >= $min_epoch) {
         Iptables_Prune_Block($current_time);
+    }
+
+    if($Config{'noauth.enabled'} == 1){
+        # Banning no response to 401 Unauthorized
+        $current_time = time();
+        if ( $current_time >= $lastNoAuthBanTime + $Config{'noauth.baninterval'} ) {
+            $lastNoAuthBanTime = $current_time;
+            # Loop on all the Auth we're waiting on
+            foreach my $sessionID (keys %pendingAuth) {
+                # Getting the information
+                my ($ip, $port, $challengeTime) = @{$pendingAuth{$sessionID}};
+                # If the wait time is > $Config{'noauth.graceperiod'} WE BAN !
+                if($current_time - $challengeTime >= $Config{'noauth.graceperiod'}){
+                    # Format the IP address
+                    my $tmp_ip = NetAddr::IP->new($ip);
+                    $tmp_ip = $tmp_ip->addr();
+                    # If the IP is already banned, there's no need to ban it again
+                    unless( exists($ban_ip{"$tmp_ip"}) ) {
+                        # If the Ban is successful, we add the timer to unban it (eventually)
+                        if( Iptables_Block($tmp_ip,"No response to 401 Unauthorized from CallID $sessionID") eq 1 ){
+                            $ban_ip{$tmp_ip} = $current_time + $Config{'timer.ban'};
+                        }
+                    }
+                    delete $pendingAuth{$sessionID};
+                }
+                # else{ # FOR DEBUG
+                #     my $timeDiff = int($current_time - $challengeTime);
+                #     print LOG Time_Stamp() . " GRACE #$timeDiff PendingAuths : CallID = $sessionID, IP:PORT = $ip:$port, WHEN = $challengeTime \n";
+                # }
+            }
+        }
     }
     
     # Buffers to flush?
