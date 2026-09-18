@@ -58,6 +58,9 @@ die "Already runnig" if Proc::PID::File->running( dir=>"/tmp/", name => basename
 my %Config;
 Config::Simple->import_from('/etc/sipban.conf', \%Config) or die Config::Simple->error();
 
+my $lastRegisterCacheRefreshTime = 0; # Unix time
+if (! exists $Config{'general.registrarCacheRefreshInterval'} ){ $Config{'general.registrarCacheRefreshInterval'} = 30; }
+
 # No Auth configuration :
 my %pendingAuth = ();
 my $lastNoAuthBanTime = 0; # Unix time
@@ -74,6 +77,9 @@ if (! exists $Config{'flood.interval'} ){ $Config{'flood.interval'} = 1; }
 # Control Parameters #
 #--------------------#
 
+# List of uri of devices registered to asterisk
+my $registrarCache;
+my $sip_tech;
 # Timers Info
 my $Start_Time = time();
 my $Ping_Time  = $Start_Time + $Config{'ami.ping'};
@@ -316,6 +322,8 @@ my %AMI_Handler = (
             if( ! defined $remote_ip ){
                 print LOG Time_Stamp() . " REMOTE IP EMPTY. packet_content_ref:\n$$packet_content_ref\n";
                 return;
+            }elsif( $registrarCache =~ m/\@$remote_ip:/ == 1 ){
+                # print LOG Time_Stamp() . " $remote_ip not banned for InvalidAccountID because an endpoint is registered with this IP.\n";
             }elsif ( ($service eq 'PJSIP') || ($service eq 'SIP') || ($service eq 'IAX') || ($service eq 'IAX2') || ($service eq 'AMI') ) {
                 $remote_ip = NetAddr::IP->new($remote_ip);
                 $remote_ip = $remote_ip->addr();
@@ -346,6 +354,8 @@ my %AMI_Handler = (
             if( ! defined $remote_ip ){
                 print LOG Time_Stamp() . " REMOTE IP EMPTY. packet_content_ref:\n$$packet_content_ref\n";
                 return;
+            }elsif( $registrarCache =~ m/\@$remote_ip:/ == 1 ){
+                # print LOG Time_Stamp() . " $remote_ip not banned for Failed ACL because an endpoint is registered with this IP.\n";
             }elsif ( ($service eq 'PJSIP') || ($service eq 'SIP') || ($service eq 'IAX') || ($service eq 'IAX2') || ($service eq 'AMI') ) {
                 $remote_ip = NetAddr::IP->new($remote_ip);
                 $remote_ip = $remote_ip->addr();
@@ -379,6 +389,8 @@ my %AMI_Handler = (
             if( ! defined $remote_ip ){
                 print LOG Time_Stamp() . " REMOTE IP EMPTY. packet_content_ref:\n$$packet_content_ref\n";
                 return;
+            }elsif( $registrarCache =~ m/\@$remote_ip:/ == 1 ){
+                # print LOG Time_Stamp() . " $remote_ip not banned for ChallengeResponseFailed because an endpoint is registered with this IP.\n";
             }elsif ( ($service eq 'PJSIP') || ($service eq 'SIP') || ($service eq 'IAX') || ($service eq 'IAX2') || ($service eq 'AMI') ) {
                 $remote_ip = NetAddr::IP->new($remote_ip);
                 $remote_ip = $remote_ip->addr();
@@ -412,6 +424,8 @@ my %AMI_Handler = (
             if( ! defined $remote_ip ){
                 print LOG Time_Stamp() . " REMOTE IP EMPTY. packet_content_ref:\n$$packet_content_ref\n";
                 return;
+            }elsif( $registrarCache =~ m/\@$remote_ip:/ == 1 ){
+                # print LOG Time_Stamp() . " $remote_ip not banned for InvalidPassword because an endpoint is registered with this IP.\n";
             }elsif ( ($service eq 'PJSIP') || ($service eq 'SIP') || ($service eq 'IAX') || ($service eq 'IAX2') || ($service eq 'AMI') ) {
                 $remote_ip = NetAddr::IP->new($remote_ip);
                 $remote_ip = $remote_ip->addr();
@@ -447,9 +461,15 @@ my %AMI_Handler = (
             }elsif ( ($service eq 'PJSIP') || ($service eq 'SIP') || ($service eq 'IAX') || ($service eq 'IAX2') || ($service eq 'AMI') ) {
                 my $now = time();
                 if($Config{'noauth.enabled'} == 1){
-                    my $pendingAuth_entry = $pendingAuth{$sessionID};
-                    if (! $pendingAuth_entry) {
-                        $pendingAuth{$sessionID} = [ $remote_ip, $remote_port, $now ];
+                    # Ignore IP that are registered to asterisk
+                    if( $registrarCache =~ m/\@$remote_ip:/ != 1 ){
+                        # Ignore if the Session ID already has a pending authentification
+                        my $pendingAuth_entry = $pendingAuth{$sessionID};
+                        if (! $pendingAuth_entry) {
+                            $pendingAuth{$sessionID} = [ $remote_ip, $remote_port, $now ];
+                        }
+                    }else{
+                        # print LOG Time_Stamp() . " $remote_ip not banned for ChallengeSent because an endpoint is registered with this IP.\n";
                     }
                 }
                 if($Config{'flood.enabled'} == 1){
@@ -470,7 +490,6 @@ my %AMI_Handler = (
                         $count=1;
                         $cache{$remote_ip} = [ $count, $now ];
                     }
-                    print LOG Time_Stamp() . " ChallengeSent to IPV$ipvx/$prot/$remote_ip/$remote_port, Increasing Failure Count : $count/" . $Config{'flood.count'} . "\n";
                 }
             }
         },
@@ -509,7 +528,6 @@ my %AMI_Handler = (
                         }else{
                             $cache{$remote_ip} = [ $count, $cached ];
                         }
-                        print LOG Time_Stamp() . " SucessfulAuth by IPV$ipvx/$prot/$remote_ip/$remote_port, Decreasing Failure count : $count/" . $Config{'flood.count'} . "\n";
                     }
                 }
             }
@@ -1087,7 +1105,21 @@ while (1) { # Main loop #
             }
         }
     }
-    
+
+    # Refreshing the list of registered devices
+    my $current_time = time();
+    if( $current_time >= $lastRegisterCacheRefreshTime + $Config{'general.registrarCacheRefreshInterval'} ){
+        $lastRegisterCacheRefreshTime = $current_time;
+        if( !$sip_tech ){
+            $sip_tech = qx(asterisk -x 'module show like chan_' | grep 'sip.*Running' | cut -d' ' -f1)
+        }
+        if($sip_tech == "chan_pjsip.so"){
+            $registrarCache = qx(asterisk -x 'database show registrar/contact' | grep '^/registrar/contact/' | cut -d':' -f2- | jq -c -C -r '.uri');
+        }elsif($sip_tech == "chan_sip.so"){
+            $registrarCache = qx(asterisk -x 'sip show peers'| grep -Pv '\(Unspecified\)|Monitored: ' | awk 'NR > 1 {print \$2}' | sort -u)
+        }
+    }
+
     # Buffers to flush?
     foreach $client ($select->can_write(1)) {
         # Skip this client if we have nothing to say

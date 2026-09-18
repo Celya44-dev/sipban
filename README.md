@@ -23,13 +23,13 @@ The service use iptables, you need the "**root**" user of your system
     a) Ubuntu/Debian
          
     ```
-    sudo apt-get install libproc-pid-file-perl libconfig-simple-perl libnet-whois-ip-perl libtime-hires-perl libtie-cache-perl libnetaddr-ip-perl
+    sudo apt-get install libproc-pid-file-perl libconfig-simple-perl libnet-whois-ip-perl libtime-hires-perl libtie-cache-perl libnetaddr-ip-perl jq awk
     ```
          
     b) Redhat/CentOS/Fedora
     
     ```     
-    sudo dnf install perl-Proc-PID-File perl-Config-Simple perl-Net-Whois-IP perl-Time-HiRes perl-Tie-Cache perl-NetAddr-IP
+    sudo dnf install perl-Proc-PID-File perl-Config-Simple perl-Net-Whois-IP perl-Time-HiRes perl-Tie-Cache perl-NetAddr-IP jq awk
     ```
          
 3. Copy configuration files
